@@ -157,6 +157,15 @@ class H2Transport:
             ],
         }
 
+    def clear_route_cooldowns(self) -> None:
+        self._ip_fail_until.clear()
+
+    def reset_route_stats(self) -> None:
+        self._ip_stats = {
+            h: {"successes": 0, "failures": 0, "last_latency_ms": 0.0}
+            for h in self._connect_hosts
+        }
+
     # ── Connection lifecycle ──────────────────────────────────────
 
     @property

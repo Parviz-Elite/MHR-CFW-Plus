@@ -129,14 +129,38 @@ try the next one.
 failover pool used by both the HTTP/1.1 connection pool and the HTTP/2
 multiplexed transport.
 
-You can inspect the live route state from the local proxy:
+You can inspect and control runtime health from the local dashboard:
 
 ```text
 http://127.0.0.1:8085/status
 ```
 
-The status endpoint returns JSON with the active Google IP, per-IP failures,
-cooldowns, H2 state, script blacklists, cache hits, and top hosts.
+The dashboard shows the active Google IP, per-IP failures, cooldowns, H2 state,
+Apps Script health, cache hits, top hosts, and a troubleshooting FAQ. It also
+has safe local controls for clearing cache, clearing IP cooldowns, clearing
+script blacklists, resetting runtime stats, and reconnecting H2.
+
+Automation and scripts can read the raw JSON API instead:
+
+```text
+http://127.0.0.1:8085/status.json
+```
+
+Dashboard controls are local-only by default. If you intentionally share the
+dashboard on your LAN, set:
+
+```json
+{
+  "dashboard_lan_access": true
+}
+```
+
+### Apps Script Health Scoring
+
+When multiple `script_ids` are configured, the proxy now tracks per-script
+request count, failure count, average latency, cooldowns, and a health score.
+The stable per-host script mapping is still preserved for session-sensitive
+sites, but fan-out fallback prefers healthier deployments first.
 
 ---
 

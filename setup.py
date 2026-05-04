@@ -88,6 +88,7 @@ def load_base_config() -> dict:
         "google_ip_fail_cooldown": 120,
         "front_domain": "www.google.com",
         "listen_host": "127.0.0.1",
+        "dashboard_lan_access": False,
         "listen_port": 8085,
         "socks5_enabled": True,
         "socks5_port": 1080,

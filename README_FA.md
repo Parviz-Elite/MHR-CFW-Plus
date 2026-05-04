@@ -536,6 +536,7 @@ curl -X POST https://forwarder.example.com/fwd \
 | `script_id` | — | Deployment ID گوگل Apps Script شما |
 | `auth_key` | — | رمز مشترک بین پروکسی و Apps Script |
 | `listen_host` | `127.0.0.1` | آدرس گوش‌دادن HTTP پروکسی |
+| `dashboard_lan_access` | `false` | اجازه دسترسی به داشبورد از شبکه محلی. پیش‌فرض فقط local است. |
 | `listen_port` | `8085` | پورت HTTP پروکسی |
 | `socks5_enabled` | `true` | فعال‌سازی پروکسی SOCKS5 |
 | `socks5_port` | `1080` | پورت SOCKS5 |
@@ -572,13 +573,31 @@ curl -X POST https://forwarder.example.com/fwd \
 
 مقدار `google_ip` همچنان مسیر پیش‌فرض و اولین گزینه است. اگر اتصال TLS به آن IP خطا بدهد، برنامه آن IP را برای مدت `google_ip_fail_cooldown` کنار می‌گذارد و سراغ IP بعدی می‌رود. این قابلیت هم برای مسیر HTTP/1.1 و هم برای HTTP/2 فعال است.
 
-برای دیدن وضعیت زنده مسیرها، این آدرس را در مرورگر باز کنید:
+برای دیدن وضعیت زنده مسیرها و کنترل‌های امن، این آدرس را در مرورگر باز کنید:
 
 ```text
 http://127.0.0.1:8085/status
 ```
 
-این endpoint وضعیت IP فعال، cooldown هر IP، وضعیت H2، scriptهای blacklist شده، آمار cache و میزبان‌های پرترافیک را به صورت JSON نشان می‌دهد.
+این داشبورد وضعیت IP فعال، cooldown هر IP، وضعیت H2، سلامت هر Apps Script، آمار cache، میزبان‌های پرترافیک و یک بخش FAQ/عیب‌یابی را نشان می‌دهد. از همان صفحه می‌توانید cache را پاک کنید، cooldown مسیرها را آزاد کنید، blacklist اسکریپت‌ها را پاک کنید، آمار runtime را reset کنید یا H2 را reconnect کنید.
+
+برای ابزارها و اسکریپت‌ها، خروجی خام JSON از این مسیر در دسترس است:
+
+```text
+http://127.0.0.1:8085/status.json
+```
+
+کنترل‌های داشبورد به صورت پیش‌فرض فقط از همان سیستم قابل استفاده‌اند. اگر عمداً می‌خواهید داشبورد روی LAN هم باز باشد:
+
+```json
+{
+  "dashboard_lan_access": true
+}
+```
+
+### امتیازدهی سلامت Apps Script
+
+اگر چند `script_id` تنظیم کرده باشید، پروکسی برای هر Deployment تعداد درخواست‌ها، خطاها، میانگین latency، cooldown و یک امتیاز سلامت نگه می‌دارد. نگاشت پایدار هر host به یک script تا حد ممکن حفظ می‌شود، اما در مسیرهای fallback و fan-out، Deploymentهای سالم‌تر زودتر انتخاب می‌شوند.
 
 ### چند script_id برای سرعت بیشتر
 

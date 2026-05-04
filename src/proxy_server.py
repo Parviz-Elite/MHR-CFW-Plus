@@ -126,6 +126,12 @@ class ResponseCache:
         self._store[url] = (raw_response, time.time() + ttl)
         self._size += size
 
+    def clear(self) -> None:
+        self._store.clear()
+        self._size = 0
+        self.hits = 0
+        self.misses = 0
+
     @staticmethod
     def parse_ttl(raw_response: bytes, url: str) -> int:
         """Determine cache TTL from response headers and URL."""
@@ -180,6 +186,8 @@ class ProxyServer:
     )
 
     def __init__(self, config: dict):
+        self._config = dict(config)
+        self._started_at = time.time()
         self.host = config.get("listen_host", "127.0.0.1")
         self.port = config.get("listen_port", 8080)
         self.socks_enabled = config.get("socks5_enabled", True)
@@ -1453,8 +1461,9 @@ class ProxyServer:
                 k, v = raw_line.decode(errors="replace").split(":", 1)
                 headers[k.strip()] = v.strip()
 
-        if self._is_local_status_request(url, headers):
-            writer.write(self._status_response())
+        if self._is_dashboard_request(url, headers):
+            response = await self._dashboard_response(method, url, headers, body, writer)
+            writer.write(response)
             await writer.drain()
             return
 
@@ -1496,32 +1505,95 @@ class ProxyServer:
         writer.write(response)
         await writer.drain()
 
-    def _is_local_status_request(self, url: str, headers: dict) -> bool:
-        """Expose a tiny local health endpoint at /status."""
+    def _is_dashboard_request(self, url: str, headers: dict) -> bool:
+        """Expose local dashboard/status endpoints."""
         absolute = "://" in url
         parsed = urlparse(url if absolute else f"http://local{url}")
-        if parsed.path.rstrip("/") != "/status":
+        path = parsed.path.rstrip("/") or "/"
+        if path not in {
+            "/status", "/dashboard", "/status.json",
+            "/api/status", "/api/control",
+        }:
             return False
-        if absolute:
-            host = parsed.hostname or ""
+        host = parsed.hostname if absolute else self._header_value(headers, "host")
+        return self._is_dashboard_host(host or "")
+
+    def _is_dashboard_host(self, raw_host: str) -> bool:
+        raw_host = raw_host.strip()
+        if raw_host.startswith("[") and "]" in raw_host:
+            host = raw_host[1:].split("]", 1)[0]
         else:
-            raw_host = self._header_value(headers, "host").strip()
-            if raw_host.startswith("[") and "]" in raw_host:
-                host = raw_host[1:].split("]", 1)[0]
-            else:
-                host = raw_host.split(":", 1)[0]
+            host = raw_host.split(":", 1)[0]
         host = host.lower()
         if host in {"", "local", "localhost", "127.0.0.1", "::1", self.host}:
             return True
+        if not self._dashboard_lan_access:
+            return False
         try:
             ip = ipaddress.ip_address(host)
             return ip.is_loopback or ip.is_private
         except ValueError:
             return False
 
-    def _status_response(self) -> bytes:
+    def _dashboard_peer_allowed(self, writer) -> bool:
+        peer = writer.get_extra_info("peername")
+        host = peer[0] if isinstance(peer, tuple) and peer else ""
+        try:
+            ip = ipaddress.ip_address(str(host))
+        except ValueError:
+            return True
+        if ip.is_loopback:
+            return True
+        return self._dashboard_lan_access and ip.is_private
+
+    async def _dashboard_response(self, method: str, url: str, headers: dict,
+                                  body: bytes, writer) -> bytes:
+        if not self._dashboard_peer_allowed(writer):
+            return self._plain_response(403, "Dashboard access is local-only.")
+
+        parsed = urlparse(url if "://" in url else f"http://local{url}")
+        path = parsed.path.rstrip("/") or "/"
+        if path == "/api/control":
+            if method.upper() != "POST":
+                return self._plain_response(405, "Method not allowed.")
+            return await self._handle_dashboard_control(body)
+        if path in {"/status.json", "/api/status"}:
+            return self._json_response(self._status_payload())
+        return self._html_response(self._dashboard_html())
+
+    async def _handle_dashboard_control(self, body: bytes) -> bytes:
+        try:
+            payload = json.loads(body.decode() or "{}")
+        except json.JSONDecodeError:
+            return self._json_response({"ok": False, "error": "invalid json"}, 400)
+        action = str(payload.get("action", "")).strip()
+
+        if action == "clear_cache":
+            self._cache.clear()
+            return self._json_response({"ok": True, "message": "cache cleared"})
+        if action == "clear_route_cooldowns":
+            self.fronter.clear_route_cooldowns()
+            return self._json_response({"ok": True, "message": "route cooldowns cleared"})
+        if action == "clear_script_blacklist":
+            self.fronter.clear_script_blacklist()
+            return self._json_response({"ok": True, "message": "script blacklist cleared"})
+        if action == "reset_runtime_stats":
+            self._cache.clear()
+            self.fronter.reset_runtime_stats()
+            return self._json_response({"ok": True, "message": "runtime stats reset"})
+        if action == "reconnect_h2":
+            ok = await self.fronter.reconnect_h2()
+            return self._json_response({
+                "ok": ok,
+                "message": "H2 reconnected" if ok else "H2 is unavailable or reconnect failed",
+            }, 200 if ok else 409)
+
+        return self._json_response({"ok": False, "error": "unknown action"}, 400)
+
+    def _status_payload(self) -> dict:
         snap = self.fronter.stats_snapshot()
         snap.update({
+            "uptime_s": int(time.time() - self._started_at),
             "http_proxy": f"{self.host}:{self.port}",
             "socks5_proxy": (
                 f"{self.socks_host}:{self.socks_port}"
@@ -1531,12 +1603,248 @@ class ProxyServer:
                 "hits": self._cache.hits,
                 "misses": self._cache.misses,
             },
+            "config": self._safe_config_snapshot(),
         })
-        body = json.dumps(snap, indent=2).encode()
+        return snap
+
+    def _safe_config_snapshot(self) -> dict:
+        hidden = {"auth_key", "psk", "upstream_auth_key"}
+        out = {}
+        for key, value in self._config.items():
+            if any(token in key.lower() for token in hidden):
+                out[key] = "***"
+            elif key in {"script_id", "script_ids"}:
+                if isinstance(value, list):
+                    out[key] = [v[-12:] if isinstance(v, str) else v for v in value]
+                elif isinstance(value, str):
+                    out[key] = value[-12:]
+                else:
+                    out[key] = value
+            else:
+                out[key] = value
+        return out
+
+    @staticmethod
+    def _plain_response(status: int, text: str) -> bytes:
+        body = text.encode()
         return (
-            b"HTTP/1.1 200 OK\r\n"
+            f"HTTP/1.1 {status} Error\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "\r\n"
+        ).encode() + body
+
+    @staticmethod
+    def _json_response(payload: dict, status: int = 200) -> bytes:
+        body = json.dumps(payload, indent=2).encode()
+        return (
+            f"HTTP/1.1 {status} OK\r\n".encode() +
             b"Content-Type: application/json; charset=utf-8\r\n"
             b"Cache-Control: no-store\r\n"
             b"Content-Length: " + str(len(body)).encode() + b"\r\n"
             b"\r\n" + body
         )
+
+    @staticmethod
+    def _html_response(html: str) -> bytes:
+        body = html.encode()
+        return (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/html; charset=utf-8\r\n"
+            b"Cache-Control: no-store\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"\r\n" + body
+        )
+
+    @staticmethod
+    def _dashboard_html() -> str:
+        return r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MHR-CFW Status</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --ink: #16181d;
+      --muted: #667085;
+      --line: #d9dee7;
+      --good: #0f7b55;
+      --warn: #a15c00;
+      --bad: #b42318;
+      --accent: #175cd3;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Inter, Segoe UI, Tahoma, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      letter-spacing: 0;
+    }
+    header {
+      border-bottom: 1px solid var(--line);
+      background: #fff;
+      position: sticky;
+      top: 0;
+      z-index: 2;
+    }
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 18px 20px; }
+    .top { display: flex; gap: 16px; align-items: center; justify-content: space-between; }
+    h1 { font-size: 22px; margin: 0; }
+    .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+    }
+    .metric .label { color: var(--muted); font-size: 12px; }
+    .metric .value { font-size: 22px; font-weight: 700; margin-top: 6px; word-break: break-word; }
+    .ok { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    main .wrap { display: grid; gap: 14px; }
+    h2 { font-size: 15px; margin: 0 0 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid #edf0f5; vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; }
+    .row { display: grid; grid-template-columns: 1.35fr .9fr; gap: 14px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    button {
+      border: 1px solid #b9c7dc;
+      background: #fff;
+      color: var(--accent);
+      border-radius: 7px;
+      min-height: 36px;
+      padding: 0 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { background: #eef4ff; }
+    .faq { display: grid; gap: 8px; }
+    details { border-top: 1px solid #edf0f5; padding: 10px 0; }
+    summary { cursor: pointer; font-weight: 650; }
+    details p { color: var(--muted); margin: 8px 0 0; line-height: 1.55; }
+    code { background: #eef1f6; padding: 2px 5px; border-radius: 5px; }
+    .toast { color: var(--muted); font-size: 13px; min-height: 18px; }
+    @media (max-width: 880px) {
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .row { grid-template-columns: 1fr; }
+      .top { align-items: flex-start; flex-direction: column; }
+    }
+    @media (max-width: 520px) {
+      .grid { grid-template-columns: 1fr; }
+      .wrap { padding: 14px; }
+      table { font-size: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap top">
+      <div>
+        <h1>MHR-CFW Runtime Status</h1>
+        <div class="sub">Local dashboard for relay health, routes, cache, and troubleshooting</div>
+      </div>
+      <div class="actions">
+        <button data-action="clear_route_cooldowns">Clear IP Cooldowns</button>
+        <button data-action="clear_script_blacklist">Clear Script Blacklist</button>
+        <button data-action="clear_cache">Clear Cache</button>
+        <button data-action="reconnect_h2">Reconnect H2</button>
+        <button data-action="reset_runtime_stats">Reset Runtime Stats</button>
+      </div>
+    </div>
+  </header>
+  <main>
+    <div class="wrap">
+      <div class="toast" id="toast"></div>
+      <section class="grid">
+        <div class="panel metric"><div class="label">Active Google IP</div><div class="value" id="activeIp">-</div></div>
+        <div class="panel metric"><div class="label">H2 Transport</div><div class="value" id="h2State">-</div></div>
+        <div class="panel metric"><div class="label">Cache</div><div class="value" id="cacheState">-</div></div>
+        <div class="panel metric"><div class="label">Uptime</div><div class="value" id="uptime">-</div></div>
+      </section>
+      <section class="row">
+        <div class="panel">
+          <h2>Google IP Routes</h2>
+          <table><thead><tr><th>IP</th><th>Success</th><th>Failure</th><th>Latency</th><th>Cooldown</th></tr></thead><tbody id="routes"></tbody></table>
+        </div>
+        <div class="panel">
+          <h2>Apps Script Health</h2>
+          <table><thead><tr><th>Script</th><th>Req</th><th>Fail</th><th>Avg</th><th>Score</th></tr></thead><tbody id="scripts"></tbody></table>
+        </div>
+      </section>
+      <section class="row">
+        <div class="panel">
+          <h2>Top Hosts</h2>
+          <table><thead><tr><th>Host</th><th>Requests</th><th>Errors</th><th>Bytes</th><th>Avg</th></tr></thead><tbody id="hosts"></tbody></table>
+        </div>
+        <div class="panel">
+          <h2>FAQ and Fixes</h2>
+          <div class="faq">
+            <details open><summary>Sites do not open, but the proxy is running</summary><p>Check `auth_key`, Apps Script deployment ID, and `google_ip`. Open `/status.json` and look for route cooldowns or script failures. Run `python main.py --scan` and put good IPs in `google_ips`.</p></details>
+            <details><summary>`unauthorized` in logs</summary><p>The `auth_key` in `config.json` does not match `AUTH_KEY` in `Code.gs`. They must be exactly identical, then deploy Apps Script again.</p></details>
+            <details><summary>Browser certificate warning</summary><p>The local MITM CA is not trusted. Run `python main.py --install-cert`, then restart the browser. Firefox may need importing `ca/ca.crt` inside Firefox settings.</p></details>
+            <details><summary>Cloudflare or CAPTCHA loops</summary><p>Cloudflare Worker exit IPs rotate. Use `script/upstream_forwarder.js` on a VPS and configure Worker upstream secrets for stable egress.</p></details>
+            <details><summary>Downloads are slow</summary><p>Use several healthy `google_ips`, keep H2 enabled, and prefer range-capable files. Increase `chunked_download_max_parallel` carefully only if route health is good.</p></details>
+            <details><summary>H2 is disconnected</summary><p>The proxy falls back to H1 automatically. Use Reconnect H2 here; if it keeps failing, the current network path may be blocking H2 ALPN.</p></details>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+  <script>
+    const fmtBytes = n => {
+      const u = ['B','KB','MB','GB']; let i = 0; n = Number(n || 0);
+      while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+      return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
+    };
+    const fmtTime = s => {
+      s = Number(s || 0); const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60); const sec = s % 60;
+      return h ? `${h}h ${m}m` : `${m}m ${sec}s`;
+    };
+    const cell = v => `<td>${v ?? '-'}</td>`;
+    async function load() {
+      const data = await fetch('/status.json', {cache: 'no-store'}).then(r => r.json());
+      const route = data.route || {};
+      document.getElementById('activeIp').textContent = route.active_google_ip || '-';
+      document.getElementById('h2State').innerHTML = data.h2?.connected ? '<span class="ok">Connected</span>' : '<span class="warn">Fallback H1</span>';
+      document.getElementById('cacheState').textContent = `${data.cache?.hits || 0} hit / ${data.cache?.misses || 0} miss`;
+      document.getElementById('uptime').textContent = fmtTime(data.uptime_s);
+      document.getElementById('routes').innerHTML = (route.google_ips || []).map(r =>
+        `<tr>${cell(r.ip)}${cell(r.successes || 0)}${cell(r.failures || 0)}${cell((r.last_latency_ms || 0) + ' ms')}${cell(r.cooldown_s ? r.cooldown_s + 's' : '-')}</tr>`
+      ).join('') || '<tr><td colspan="5">No route data yet</td></tr>';
+      document.getElementById('scripts').innerHTML = (data.script_health || []).map(s =>
+        `<tr>${cell(s.sid)}${cell(s.requests)}${cell(s.failures)}${cell((s.avg_ms || 0) + ' ms')}${cell(s.score ?? (s.cooldown_s ? 'cooldown' : '-'))}</tr>`
+      ).join('') || '<tr><td colspan="5">No script data yet</td></tr>';
+      document.getElementById('hosts').innerHTML = (data.per_site || []).slice(0, 12).map(h =>
+        `<tr>${cell(h.host)}${cell(h.requests)}${cell(h.errors)}${cell(fmtBytes(h.bytes))}${cell((h.avg_ms || 0) + ' ms')}</tr>`
+      ).join('') || '<tr><td colspan="5">No traffic yet</td></tr>';
+    }
+    async function action(name) {
+      const toast = document.getElementById('toast');
+      toast.textContent = 'Working...';
+      try {
+        const res = await fetch('/api/control', {method: 'POST', body: JSON.stringify({action: name})});
+        const data = await res.json();
+        toast.textContent = data.message || data.error || 'Done';
+        await load();
+      } catch (e) {
+        toast.textContent = String(e);
+      }
+    }
+    document.querySelectorAll('button[data-action]').forEach(btn => {
+      btn.addEventListener('click', () => action(btn.dataset.action));
+    });
+    load();
+    setInterval(load, 5000);
+  </script>
+</body>
+</html>"""
+        self._dashboard_lan_access = bool(config.get("dashboard_lan_access", False))

@@ -60,6 +60,17 @@ class HostStat:
     errors: int = 0
 
 
+@dataclass
+class ScriptStat:
+    requests: int = 0
+    successes: int = 0
+    failures: int = 0
+    total_latency_ns: int = 0
+    last_error: str = ""
+    last_ok_at: float = 0.0
+    last_error_at: float = 0.0
+
+
 def _build_sni_pool(front_domain: str, overrides: list | None) -> list[str]:
     """Build the list of SNIs to rotate through on new outbound TLS handshakes.
 
@@ -158,6 +169,9 @@ class DomainFronter:
                                           len(self._script_ids)))
         self._sid_blacklist: dict[str, float] = {}
         self._blacklist_ttl = SCRIPT_BLACKLIST_TTL
+        self._sid_stats: dict[str, ScriptStat] = {
+            sid: ScriptStat() for sid in self._script_ids
+        }
 
         # Per-host stats (requests, cache hits, bytes, cumulative latency).
         self._per_site: dict[str, HostStat] = {}
@@ -491,6 +505,60 @@ class DomainFronter:
                     int(self._blacklist_ttl),
                     f" ({reason})" if reason else "")
 
+    def _record_sid_success(self, sid: str, latency_ns: int) -> None:
+        stat = self._sid_stats.setdefault(sid, ScriptStat())
+        stat.requests += 1
+        stat.successes += 1
+        stat.total_latency_ns += max(0, int(latency_ns))
+        stat.last_error = ""
+        stat.last_ok_at = time.time()
+
+    def _record_sid_failure(self, sid: str, exc: BaseException) -> None:
+        stat = self._sid_stats.setdefault(sid, ScriptStat())
+        stat.requests += 1
+        stat.failures += 1
+        stat.last_error = type(exc).__name__
+        stat.last_error_at = time.time()
+
+    def _sid_score(self, sid: str) -> float:
+        """Lower is better. Combines latency, failures, and cooldown state."""
+        if self._is_sid_blacklisted(sid):
+            return float("inf")
+        stat = self._sid_stats.get(sid)
+        if not stat or not stat.successes:
+            return 0.0
+        avg_ms = stat.total_latency_ns / stat.successes / 1e6
+        fail_rate = stat.failures / max(1, stat.requests)
+        return avg_ms + (fail_rate * 2000.0)
+
+    def _sid_snapshot(self) -> list[dict]:
+        now = time.time()
+        rows = []
+        for sid in self._script_ids:
+            stat = self._sid_stats.get(sid, ScriptStat())
+            avg_ms = (
+                stat.total_latency_ns / stat.successes / 1e6
+                if stat.successes else 0.0
+            )
+            rows.append({
+                "sid": sid[-12:] if len(sid) > 12 else sid,
+                "requests": stat.requests,
+                "successes": stat.successes,
+                "failures": stat.failures,
+                "avg_ms": round(avg_ms, 1),
+                "score": (
+                    None if self._sid_score(sid) == float("inf")
+                    else round(self._sid_score(sid), 1)
+                ),
+                "cooldown_s": int(max(0, self._sid_blacklist.get(sid, 0) - now)),
+                "last_error": stat.last_error,
+            })
+        rows.sort(key=lambda row: (
+            row["score"] is None,
+            row["score"] if row["score"] is not None else 999999,
+        ))
+        return rows
+
     def _prune_blacklist(self, force: bool = False) -> None:
         now = time.time()
         for sid, until in list(self._sid_blacklist.items()):
@@ -511,6 +579,7 @@ class DomainFronter:
         picked = [primary]
         others = [s for s in self._script_ids
                   if s != primary and not self._is_sid_blacklisted(s)]
+        others.sort(key=self._sid_score)
         # Round-robin-ish selection from `others`
         for sid in others:
             if len(picked) >= self._parallel_relay:
@@ -731,6 +800,7 @@ class DomainFronter:
         return {
             "per_site": per_site,
             "blacklisted_scripts": blacklisted,
+            "script_health": self._sid_snapshot(),
             "sni_rotation": list(self._sni_hosts),
             "route": self._connect_route_snapshot(),
             "h2": {
@@ -740,6 +810,35 @@ class DomainFronter:
             },
             "parallel_relay": self._parallel_relay,
         }
+
+    def clear_route_cooldowns(self) -> None:
+        self._ip_fail_until.clear()
+        if self._h2 and hasattr(self._h2, "clear_route_cooldowns"):
+            self._h2.clear_route_cooldowns()
+
+    def clear_script_blacklist(self) -> None:
+        self._sid_blacklist.clear()
+
+    def reset_runtime_stats(self) -> None:
+        self._per_site.clear()
+        self._sid_stats = {sid: ScriptStat() for sid in self._script_ids}
+        self._ip_stats = {
+            host: {"successes": 0, "failures": 0, "last_latency_ms": 0.0}
+            for host in self._connect_hosts
+        }
+        if self._h2 and hasattr(self._h2, "reset_route_stats"):
+            self._h2.reset_route_stats()
+
+    async def reconnect_h2(self) -> bool:
+        if not self._h2:
+            return False
+        try:
+            await self._h2.reconnect()
+            self._record_h2_success()
+            return True
+        except Exception as exc:
+            self._record_h2_failure(exc)
+            return False
 
     async def _stats_logger(self):
         """Periodically log top hosts by bytes. DEBUG-level, low overhead."""
@@ -786,10 +885,16 @@ class DomainFronter:
         digest = hashlib.sha1(key.encode("utf-8")).digest()
         base = int.from_bytes(digest[:4], "big") % len(self._script_ids)
         n = len(self._script_ids)
-        for offset in range(n):
-            sid = self._script_ids[(base + offset) % n]
-            if not self._is_sid_blacklisted(sid):
-                return sid
+        candidates = [self._script_ids[(base + offset) % n] for offset in range(n)]
+        healthy = [sid for sid in candidates if not self._is_sid_blacklisted(sid)]
+        if healthy:
+            base_sid = candidates[0]
+            best_sid = min(healthy, key=self._sid_score)
+            base_score = self._sid_score(base_sid)
+            best_score = self._sid_score(best_sid)
+            if base_sid in healthy and base_score <= best_score + 350:
+                return base_sid
+            return best_sid
         return self._script_ids[base]
 
     def _exec_path(self, url_or_host: str | None = None) -> str:
@@ -1888,15 +1993,21 @@ class DomainFronter:
         full_payload["k"] = self.auth_key
         json_body = json.dumps(full_payload).encode()
 
-        path = self._exec_path(payload.get("u"))
-
-        status, headers, body = await self._h2.request(
-            method="POST", path=path, host=self.http_host,
-            headers={"content-type": "application/json"},
-            body=json_body,
-        )
-
-        return self._parse_relay_response(body)
+        sid = self._script_id_for_key(self._host_key(payload.get("u")))
+        path = self._exec_path_for_sid(sid)
+        t0 = time.perf_counter_ns()
+        try:
+            status, headers, body = await self._h2.request(
+                method="POST", path=path, host=self.http_host,
+                headers={"content-type": "application/json"},
+                body=json_body,
+            )
+            result = self._parse_relay_response(body)
+            self._record_sid_success(sid, time.perf_counter_ns() - t0)
+            return result
+        except Exception as exc:
+            self._record_sid_failure(sid, exc)
+            raise
 
     async def _relay_single_h2_with_sid(self, payload: dict,
                                         sid: str) -> bytes:
@@ -1910,14 +2021,19 @@ class DomainFronter:
         json_body = json.dumps(full_payload).encode()
 
         path = self._exec_path_for_sid(sid)
-
-        status, headers, body = await self._h2.request(
-            method="POST", path=path, host=self.http_host,
-            headers={"content-type": "application/json"},
-            body=json_body,
-        )
-
-        return self._parse_relay_response(body)
+        t0 = time.perf_counter_ns()
+        try:
+            status, headers, body = await self._h2.request(
+                method="POST", path=path, host=self.http_host,
+                headers={"content-type": "application/json"},
+                body=json_body,
+            )
+            result = self._parse_relay_response(body)
+            self._record_sid_success(sid, time.perf_counter_ns() - t0)
+            return result
+        except Exception as exc:
+            self._record_sid_failure(sid, exc)
+            raise
 
     async def _relay_single(self, payload: dict) -> bytes:
         """Execute a single relay POST → redirect → parse."""
@@ -1926,8 +2042,10 @@ class DomainFronter:
         full_payload["k"] = self.auth_key
         json_body = json.dumps(full_payload).encode()
 
-        path = self._exec_path(payload.get("u"))
+        sid = self._script_id_for_key(self._host_key(payload.get("u")))
+        path = self._exec_path_for_sid(sid)
         reader, writer, created = await self._acquire()
+        t0 = time.perf_counter_ns()
 
         try:
             request = (
@@ -1974,9 +2092,12 @@ class DomainFronter:
                 status, resp_headers, resp_body = await self._read_http_response(reader)
 
             await self._release(reader, writer, created)
-            return self._parse_relay_response(resp_body)
+            result = self._parse_relay_response(resp_body)
+            self._record_sid_success(sid, time.perf_counter_ns() - t0)
+            return result
 
-        except Exception:
+        except Exception as exc:
+            self._record_sid_failure(sid, exc)
             try:
                 writer.close()
             except Exception:
@@ -1990,7 +2111,11 @@ class DomainFronter:
             "q": payloads,
         }
         json_body = json.dumps(batch_payload).encode()
-        path = self._exec_path(payloads[0].get("u") if payloads else None)
+        sid = self._script_id_for_key(
+            self._host_key(payloads[0].get("u") if payloads else None)
+        )
+        path = self._exec_path_for_sid(sid)
+        t0 = time.perf_counter_ns()
 
         # Try HTTP/2 first
         if self._h2_available():
@@ -2004,8 +2129,11 @@ class DomainFronter:
                     timeout=30,
                 )
                 self._record_h2_success()
-                return self._parse_batch_body(body, payloads)
+                results = self._parse_batch_body(body, payloads)
+                self._record_sid_success(sid, time.perf_counter_ns() - t0)
+                return results
             except Exception as e:
+                self._record_sid_failure(sid, e)
                 self._record_h2_failure(e)
                 log.debug("H2 batch failed (%s), falling back to H1", e)
 
@@ -2057,14 +2185,17 @@ class DomainFronter:
 
                 await self._release(reader, writer, created)
 
-            except Exception:
+            except Exception as exc:
+                self._record_sid_failure(sid, exc)
                 try:
                     writer.close()
                 except Exception:
                     pass
                 raise
 
-        return self._parse_batch_body(resp_body, payloads)
+        results = self._parse_batch_body(resp_body, payloads)
+        self._record_sid_success(sid, time.perf_counter_ns() - t0)
+        return results
 
     def _parse_batch_body(self, resp_body: bytes,
                           payloads: list[dict]) -> list[bytes]:
