@@ -614,6 +614,28 @@ http://127.0.0.1:8085/status.json
 
 اگر چند `script_id` تنظیم کرده باشید، پروکسی برای هر Deployment تعداد درخواست‌ها، خطاها، میانگین latency، cooldown و یک امتیاز سلامت نگه می‌دارد. نگاشت پایدار هر host به یک script تا حد ممکن حفظ می‌شود، اما در مسیرهای fallback و fan-out، Deploymentهای سالم‌تر زودتر انتخاب می‌شوند.
 
+### جدول عیب‌یابی سریع
+
+همین جدول داخل صفحه `/status` هم نمایش داده می‌شود تا کاربر بدون باز کردن README بتواند مشکل را پیدا کند.
+
+| مشکل | راه‌حل پیشنهادی |
+|------|----------------|
+| `Config not found` | دستور `python setup.py` را اجرا کنید، یا `config.example.json` را به `config.json` کپی کنید و `script_id` و `auth_key` را پر کنید. |
+| مرورگر خطای certificate نشان می‌دهد | دستور `python main.py --install-cert` را اجرا کنید، سپس مرورگر را کامل ببندید و دوباره باز کنید. در Firefox باید `ca/ca.crt` را جداگانه در تنظیمات Certificates وارد کنید. |
+| تلگرام کار می‌کند اما سایت‌ها در مرورگر باز نمی‌شوند | معمولاً CA نصب نشده یا trusted نیست. فایل `ca/ca.crt` را نصب کنید و مرورگر را کامل ری‌استارت کنید. |
+| CA نصب شده اما Chrome/Edge هنوز خطا می‌دهد | Chrome و Edge وضعیت certificate را cache می‌کنند. همه processهای مرورگر را از Task Manager یا system tray ببندید و دوباره باز کنید. |
+| خطای `unauthorized` در لاگ | مقدار `auth_key` در `config.json` باید دقیقاً با `AUTH_KEY` در `Code.gs` یکی باشد. بعد از تغییر `Code.gs` دوباره Deploy جدید بسازید. |
+| اتصال timeout می‌شود | `python main.py --scan` را اجرا کنید، چند IP سالم را در `google_ips` بگذارید، سپس از `/status` گزینه Clear IP Cooldowns را بزنید یا برنامه را ری‌استارت کنید. |
+| خطای `502 Bad JSON` یا `invalid worker response` | `script_id`، سهمیه Apps Script، Deploy جدید بعد از تغییر `Code.gs`، و مقدار `WORKER_URL` در Apps Script را بررسی کنید. |
+| مرور کند است | چند `script_id` بسازید، H2 را فعال نگه دارید، چند `google_ips` سالم بگذارید و در `/status` امتیاز سلامت scriptها را بررسی کنید. |
+| SOCKS5 با تلگرام خوب کار نمی‌کند | برای تلگرام حالت HTTP proxy با `127.0.0.1:8085` را استفاده کنید. بعضی کلاینت‌های SOCKS5 به IP خام وصل می‌شوند و داده غیر HTTP می‌فرستند که قابل relay نیست. |
+| YouTube باز می‌شود اما ویدیو پخش نمی‌شود | مقدار `youtube_via_relay` را `true` کنید، یا بررسی کنید مسیر SNI-rewrite باعث محدودیت SafeSearch/video نشده باشد. |
+| Cloudflare یا CAPTCHA مدام تکرار می‌شود | IP خروجی Worker ثابت نیست. `script/upstream_forwarder.js` را روی VPS اجرا کنید و secretهای upstream را در Worker تنظیم کنید. |
+| H2 قطع است | مسیر H1 خودکار استفاده می‌شود. از `/status` گزینه Reconnect H2 را بزنید؛ اگر دائم خطا می‌دهد احتمالاً مسیر فعلی ALPN/H2 را محدود کرده است. |
+| تنظیمات از داشبورد ذخیره شده اما رفتار عوض نشده | داشبورد `config.json` را ذخیره می‌کند، اما بیشتر تنظیمات برای اعمال کامل نیاز به ری‌استارت پروکسی دارند. |
+| داشبورد از موبایل یا LAN باز نمی‌شود | دسترسی داشبورد به صورت پیش‌فرض local-only است. فقط در شبکه امن `dashboard_lan_access` را `true` کنید و ری‌استارت کنید. |
+| سهمیه Apps Script تمام شده | تا زمان reset سهمیه صبر کنید، `parallel_relay` را کمتر کنید، چند `script_id` اضافه کنید و دانلودهای سنگین را از Apps Script عبور ندهید. |
+
 ### چند script_id برای سرعت بیشتر
 
 اگر چندین پروژه Apps Script دارید، می‌توانید ID آن‌ها را به صورت لیست بدهید:

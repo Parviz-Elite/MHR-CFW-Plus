@@ -16,6 +16,9 @@
   viewing and safely editing `config.json` from the browser.
 - Added dashboard control actions for clearing cache, clearing route cooldowns,
   clearing script blacklists, resetting runtime stats, and reconnecting H2.
+- Expanded the dashboard troubleshooting section with common setup, CA, relay,
+  Apps Script quota, SOCKS5/Telegram, YouTube, CAPTCHA, H2, and dashboard access
+  fixes.
 - Added Apps Script health scoring so script latency/failure history is visible
   and fan-out relay can prefer healthier fallback deployments.
 

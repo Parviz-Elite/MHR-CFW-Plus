@@ -179,6 +179,29 @@ request count, failure count, average latency, cooldowns, and a health score.
 The stable per-host script mapping is still preserved for session-sensitive
 sites, but fan-out fallback prefers healthier deployments first.
 
+### Troubleshooting Reference
+
+The `/status` page includes this same reference so users can diagnose common
+problems without opening the README.
+
+| Problem | What to Check / Fix |
+|---|---|
+| `Config not found` | Run `python setup.py`, or copy `config.example.json` to `config.json` and fill `script_id` plus `auth_key`. |
+| Browser shows certificate errors | Install the MITM CA with `python main.py --install-cert`, then fully restart the browser. Firefox needs importing `ca/ca.crt` inside Firefox certificate settings. |
+| Telegram works but browser does not load sites | Usually the CA certificate is missing or not trusted. Install `ca/ca.crt`, then close every browser process and reopen. |
+| Installed the cert but Chrome/Edge still errors | Chrome and Edge cache certificate state. Close all browser processes from Task Manager/system tray and reopen. |
+| `unauthorized` in logs | `auth_key` in `config.json` must exactly match `AUTH_KEY` in `Code.gs`. Re-deploy Apps Script after changing `Code.gs`. |
+| Connection timeout | Run `python main.py --scan`, add several reachable IPs to `google_ips`, then clear IP cooldowns from `/status` or restart. |
+| `502 Bad JSON` or invalid Worker response | Check `script_id`, Apps Script quota, whether you created a new deployment after editing `Code.gs`, and whether `WORKER_URL` points to your Worker. |
+| Slow browsing | Add multiple `script_ids`, keep H2 working, use several healthy `google_ips`, and watch script health scores in `/status`. |
+| SOCKS5 works poorly with Telegram | Use Telegram's HTTP proxy mode at `127.0.0.1:8085`. SOCKS5 clients may connect to raw IPs and send non-HTTP bytes that cannot be relayed. |
+| YouTube opens but videos do not play | Try `"youtube_via_relay": true`, or check if the SNI-rewrite route is causing SafeSearch/video restrictions. |
+| Cloudflare / CAPTCHA loops | Cloudflare Worker egress IP rotates. Deploy `script/upstream_forwarder.js` on a VPS and configure Worker upstream secrets for stable egress. |
+| H2 disconnected | H1 fallback is automatic. Use **Reconnect H2** in `/status`; repeated failures can mean H2 ALPN is blocked on that route. |
+| Config saved from dashboard but behavior did not change | The dashboard writes `config.json`, but most settings require restarting the proxy to apply. |
+| Dashboard not reachable from phone/LAN | Dashboard access is local-only by default. Set `"dashboard_lan_access": true` only on trusted LANs, then restart. |
+| Apps Script quota exceeded | Wait for quota reset, reduce `parallel_relay`, add more `script_ids`, and avoid heavy downloads through Apps Script. |
+
 ---
 
 ## Optional: Stable Exit IP via Upstream Forwarder

@@ -1979,6 +1979,10 @@ class ProxyServer:
     }
     button:hover { background: #eef4ff; }
     .faq { display: grid; gap: 8px; }
+    .faq-grid { display: grid; grid-template-columns: 1fr; gap: 8px; }
+    .fix-row { border-top: 1px solid #edf0f5; padding: 10px 0; }
+    .fix-row b { display: block; margin-bottom: 5px; }
+    .fix-row span { color: var(--muted); font-size: 13px; line-height: 1.5; }
     details { border-top: 1px solid #edf0f5; padding: 10px 0; }
     summary { cursor: pointer; font-weight: 650; }
     details p { color: var(--muted); margin: 8px 0 0; line-height: 1.55; }
@@ -2040,14 +2044,7 @@ class ProxyServer:
         </div>
         <div class="panel">
           <h2>FAQ and Fixes</h2>
-          <div class="faq">
-            <details open><summary>Sites do not open, but the proxy is running</summary><p>Check `auth_key`, Apps Script deployment ID, and `google_ip`. Open `/status.json` and look for route cooldowns or script failures. Run `python main.py --scan` and put good IPs in `google_ips`.</p></details>
-            <details><summary>`unauthorized` in logs</summary><p>The `auth_key` in `config.json` does not match `AUTH_KEY` in `Code.gs`. They must be exactly identical, then deploy Apps Script again.</p></details>
-            <details><summary>Browser certificate warning</summary><p>The local MITM CA is not trusted. Run `python main.py --install-cert`, then restart the browser. Firefox may need importing `ca/ca.crt` inside Firefox settings.</p></details>
-            <details><summary>Cloudflare or CAPTCHA loops</summary><p>Cloudflare Worker exit IPs rotate. Use `script/upstream_forwarder.js` on a VPS and configure Worker upstream secrets for stable egress.</p></details>
-            <details><summary>Downloads are slow</summary><p>Use several healthy `google_ips`, keep H2 enabled, and prefer range-capable files. Increase `chunked_download_max_parallel` carefully only if route health is good.</p></details>
-            <details><summary>H2 is disconnected</summary><p>The proxy falls back to H1 automatically. Use Reconnect H2 here; if it keeps failing, the current network path may be blocking H2 ALPN.</p></details>
-          </div>
+          <div class="faq-grid" id="fixes"></div>
         </div>
       </section>
     </div>
@@ -2064,6 +2061,26 @@ class ProxyServer:
       return h ? `${h}h ${m}m` : `${m}m ${sec}s`;
     };
     const cell = v => `<td>${v ?? '-'}</td>`;
+    const fixes = [
+      ['Config not found', 'Run the setup wizard or copy config.example.json to config.json, then fill script_id and auth_key.'],
+      ['Browser certificate errors', 'Install ca/ca.crt with python main.py --install-cert, fully close and reopen the browser. Firefox needs separate import in its certificate settings.'],
+      ['Telegram works but browser does not', 'This is usually a missing MITM CA. Install the CA and restart the browser.'],
+      ['Installed CA but Chrome or Edge still errors', 'Close every Chrome/Edge process from Task Manager or system tray, then reopen. Certificate state is cached.'],
+      ['unauthorized', 'auth_key in config.json must exactly match AUTH_KEY in Code.gs. Re-deploy Apps Script after changing Code.gs.'],
+      ['Connection timeout', 'Run python main.py --scan, add several reachable IPs to google_ips, then clear IP cooldowns or restart.'],
+      ['502 Bad JSON or invalid worker response', 'Wrong script_id, Apps Script quota exhaustion, stale deployment, or Worker URL mismatch. Create a new Apps Script deployment and check WORKER_URL.'],
+      ['Slow browsing', 'Use several script_ids, keep H2 available, add healthy google_ips, and watch script_health scores.'],
+      ['SOCKS5 works poorly with Telegram', 'Use Telegram HTTP proxy mode on 127.0.0.1:8085. SOCKS5 clients may send raw IP traffic that cannot be relayed.'],
+      ['YouTube opens but videos do not play', 'Try youtube_via_relay=true, or check whether SNI-rewrite path is forcing SafeSearch/video restrictions.'],
+      ['Cloudflare or CAPTCHA loops', 'Worker egress IP rotates. Deploy script/upstream_forwarder.js on a VPS and configure Worker upstream secrets for stable egress.'],
+      ['H2 disconnected', 'H1 fallback is automatic. Use Reconnect H2; repeated failures can mean H2 ALPN is blocked on the current path.'],
+      ['Config dashboard saved but nothing changed', 'Most config changes require restarting the proxy. The dashboard writes config.json but does not hot-reload runtime settings.'],
+      ['Dashboard is not reachable from phone/LAN', 'Keep dashboard local by default. Set dashboard_lan_access=true only on trusted LANs, then restart.'],
+      ['Apps Script quota exceeded', 'Wait for quota reset, reduce parallel_relay, add more script_ids, or avoid heavy downloads through Apps Script.']
+    ];
+    document.getElementById('fixes').innerHTML = fixes.map(([problem, solution]) =>
+      `<div class="fix-row"><b>${problem}</b><span>${solution}</span></div>`
+    ).join('');
     async function load() {
       const data = await fetch('/status.json', {cache: 'no-store'}).then(r => r.json());
       const route = data.route || {};
