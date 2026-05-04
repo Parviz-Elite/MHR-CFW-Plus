@@ -7,6 +7,7 @@ as JSON to script.google.com fronted through www.google.com).
 """
 
 import asyncio
+import json
 import logging
 import re
 import socket
@@ -1452,6 +1453,11 @@ class ProxyServer:
                 k, v = raw_line.decode(errors="replace").split(":", 1)
                 headers[k.strip()] = v.strip()
 
+        if self._is_local_status_request(url, headers):
+            writer.write(self._status_response())
+            await writer.drain()
+            return
+
         # ── CORS preflight over plain HTTP ─────────────────────────────
         origin = self._header_value(headers, "origin")
         acr_method = self._header_value(headers, "access-control-request-method")
@@ -1489,3 +1495,48 @@ class ProxyServer:
 
         writer.write(response)
         await writer.drain()
+
+    def _is_local_status_request(self, url: str, headers: dict) -> bool:
+        """Expose a tiny local health endpoint at /status."""
+        absolute = "://" in url
+        parsed = urlparse(url if absolute else f"http://local{url}")
+        if parsed.path.rstrip("/") != "/status":
+            return False
+        if absolute:
+            host = parsed.hostname or ""
+        else:
+            raw_host = self._header_value(headers, "host").strip()
+            if raw_host.startswith("[") and "]" in raw_host:
+                host = raw_host[1:].split("]", 1)[0]
+            else:
+                host = raw_host.split(":", 1)[0]
+        host = host.lower()
+        if host in {"", "local", "localhost", "127.0.0.1", "::1", self.host}:
+            return True
+        try:
+            ip = ipaddress.ip_address(host)
+            return ip.is_loopback or ip.is_private
+        except ValueError:
+            return False
+
+    def _status_response(self) -> bytes:
+        snap = self.fronter.stats_snapshot()
+        snap.update({
+            "http_proxy": f"{self.host}:{self.port}",
+            "socks5_proxy": (
+                f"{self.socks_host}:{self.socks_port}"
+                if self.socks_enabled else None
+            ),
+            "cache": {
+                "hits": self._cache.hits,
+                "misses": self._cache.misses,
+            },
+        })
+        body = json.dumps(snap, indent=2).encode()
+        return (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: application/json; charset=utf-8\r\n"
+            b"Cache-Control: no-store\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"\r\n" + body
+        )

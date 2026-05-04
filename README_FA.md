@@ -530,6 +530,8 @@ curl -X POST https://forwarder.example.com/fwd \
 | کلید | پیش‌فرض | توضیح |
 |------|---------|-------|
 | `google_ip` | `216.239.38.120` | IP سرور Google برای domain fronting. از ابزار اسکن برای یافتن سریع‌ترین IP استفاده کنید. |
+| `google_ips` | — | لیست IPهای جایگزین گوگل برای failover خودکار هنگام timeout یا قطع مسیر |
+| `google_ip_fail_cooldown` | `120` | مدت زمان کنار گذاشتن موقت یک IP خراب، بر حسب ثانیه |
 | `front_domain` | `www.google.com` | دامنه‌ای که در SNI به سیستم فیلترینگ نمایش داده می‌شود |
 | `script_id` | — | Deployment ID گوگل Apps Script شما |
 | `auth_key` | — | رمز مشترک بین پروکسی و Apps Script |
@@ -550,6 +552,33 @@ curl -X POST https://forwarder.example.com/fwd \
 | `tcp_connect_timeout` | `10` | مهلت اتصال TCP مستقیم (ثانیه) |
 | `max_response_body_bytes` | `209715200` | حداکثر حجم پاسخ (200 مگابایت) |
 | `parallel_relay` | `1` | تعداد Apps Script که به صورت موازی استفاده می‌شوند (نیاز به چند `script_id`) |
+
+### Failover خودکار IP گوگل
+
+در ایران ممکن است یک IP گوگل روی یک اپراتور سریع باشد و همان IP روی اپراتور دیگر timeout بدهد. برای همین می‌توانید چند IP بدهید تا پروکسی هنگام خرابی یا کندی شدید، مسیر بعدی را امتحان کند:
+
+```json
+{
+  "google_ip": "216.239.38.120",
+  "google_ips": [
+    "216.239.38.120",
+    "216.239.36.120",
+    "142.250.80.142",
+    "172.217.14.206"
+  ],
+  "google_ip_fail_cooldown": 120
+}
+```
+
+مقدار `google_ip` همچنان مسیر پیش‌فرض و اولین گزینه است. اگر اتصال TLS به آن IP خطا بدهد، برنامه آن IP را برای مدت `google_ip_fail_cooldown` کنار می‌گذارد و سراغ IP بعدی می‌رود. این قابلیت هم برای مسیر HTTP/1.1 و هم برای HTTP/2 فعال است.
+
+برای دیدن وضعیت زنده مسیرها، این آدرس را در مرورگر باز کنید:
+
+```text
+http://127.0.0.1:8085/status
+```
+
+این endpoint وضعیت IP فعال، cooldown هر IP، وضعیت H2، scriptهای blacklist شده، آمار cache و میزبان‌های پرترافیک را به صورت JSON نشان می‌دهد.
 
 ### چند script_id برای سرعت بیشتر
 
@@ -654,7 +683,7 @@ Top 3 fastest IPs:
 Recommended: Set "google_ip": "216.239.38.120" in config.json
 ```
 
-IP پیشنهادشده را در `config.json` در قسمت `google_ip` قرار دهید.
+IP پیشنهادشده را در `config.json` در قسمت `google_ip` قرار دهید. اگر چند IP قابل قبول دیدید، آن‌ها را در `google_ips` هم بگذارید تا failover خودکار فعال شود.
 
 ---
 

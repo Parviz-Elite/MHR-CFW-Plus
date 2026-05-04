@@ -105,6 +105,41 @@ Open [ipleak.net](https://ipleak.net) in your browser, you should see your ip ad
 
 ---
 
+## Adaptive Google IP Failover
+
+Some networks allow one Google frontend IP while slowing or dropping another.
+You can now give the proxy a small pool of Google IPs. New TLS connections
+skip an IP for a short cooldown when it times out or fails, then automatically
+try the next one.
+
+```json
+{
+  "google_ip": "216.239.38.120",
+  "google_ips": [
+    "216.239.38.120",
+    "216.239.36.120",
+    "142.250.80.142",
+    "172.217.14.206"
+  ],
+  "google_ip_fail_cooldown": 120
+}
+```
+
+`google_ip` is still used as the first/default route. `google_ips` is the
+failover pool used by both the HTTP/1.1 connection pool and the HTTP/2
+multiplexed transport.
+
+You can inspect the live route state from the local proxy:
+
+```text
+http://127.0.0.1:8085/status
+```
+
+The status endpoint returns JSON with the active Google IP, per-IP failures,
+cooldowns, H2 state, script blacklists, cache hits, and top hosts.
+
+---
+
 ## Optional: Stable Exit IP via Upstream Forwarder
 
 CAPTCHAs (Cloudflare Turnstile/bot challenge, reCAPTCHA, hCaptcha) bind tokens

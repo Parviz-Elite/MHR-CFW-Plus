@@ -68,8 +68,20 @@ class H2Transport:
 
     def __init__(self, connect_host: str, sni_host: str,
                  verify_ssl: bool = True,
-                 sni_hosts: list[str] | None = None):
-        self.connect_host = connect_host
+                 sni_hosts: list[str] | None = None,
+                 connect_hosts: list[str] | None = None,
+                 ip_fail_cooldown: float = 120.0):
+        self._connect_hosts: list[str] = (
+            [h for h in (connect_hosts or []) if h] or [connect_host]
+        )
+        self.connect_host = self._connect_hosts[0]
+        self._connect_idx: int = 0
+        self._ip_fail_cooldown = max(5.0, float(ip_fail_cooldown or 120.0))
+        self._ip_fail_until: dict[str, float] = {}
+        self._ip_stats: dict[str, dict[str, float | int]] = {
+            h: {"successes": 0, "failures": 0, "last_latency_ms": 0.0}
+            for h in self._connect_hosts
+        }
         self.sni_host = sni_host
         self.verify_ssl = verify_ssl
         # Optional SNI rotation pool — picked round-robin on each new connect.
@@ -94,6 +106,56 @@ class H2Transport:
         # Stats
         self.total_requests = 0
         self.total_streams = 0
+
+    def _next_connect_host(self) -> str:
+        """Return the next usable Google frontend IP, skipping cooled-down IPs."""
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        n = len(self._connect_hosts)
+        for _ in range(n):
+            host = self._connect_hosts[self._connect_idx % n]
+            self._connect_idx += 1
+            until = self._ip_fail_until.get(host, 0.0)
+            if until <= now:
+                self._ip_fail_until.pop(host, None)
+                self.connect_host = host
+                return host
+        host = self._connect_hosts[self._connect_idx % n]
+        self._connect_idx += 1
+        self.connect_host = host
+        return host
+
+    def _record_ip_success(self, host: str, latency_ms: float) -> None:
+        stat = self._ip_stats.setdefault(
+            host, {"successes": 0, "failures": 0, "last_latency_ms": 0.0}
+        )
+        stat["successes"] = int(stat.get("successes", 0)) + 1
+        stat["last_latency_ms"] = round(float(latency_ms), 1)
+        self._ip_fail_until.pop(host, None)
+
+    def _record_ip_failure(self, host: str) -> None:
+        stat = self._ip_stats.setdefault(
+            host, {"successes": 0, "failures": 0, "last_latency_ms": 0.0}
+        )
+        stat["failures"] = int(stat.get("failures", 0)) + 1
+        if len(self._connect_hosts) > 1:
+            self._ip_fail_until[host] = (
+                asyncio.get_running_loop().time() + self._ip_fail_cooldown
+            )
+
+    def route_snapshot(self) -> dict:
+        now = asyncio.get_running_loop().time()
+        return {
+            "active_google_ip": self.connect_host,
+            "google_ips": [
+                {
+                    "ip": host,
+                    "cooldown_s": int(max(0, self._ip_fail_until.get(host, 0) - now)),
+                    **self._ip_stats.get(host, {}),
+                }
+                for host in self._connect_hosts
+            ],
+        }
 
     # ── Connection lifecycle ──────────────────────────────────────
 
@@ -135,37 +197,49 @@ class H2Transport:
         # Create raw TCP socket with TCP_NODELAY BEFORE TLS handshake.
         # Nagle's algorithm can delay small writes (H2 frames) by up to 200ms
         # waiting to coalesce — TCP_NODELAY forces immediate send.
-        raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        raw.setblocking(False)
+        last_exc = None
+        for _ in range(len(self._connect_hosts)):
+            host = self._next_connect_host()
+            raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            raw.setblocking(False)
+            started = asyncio.get_running_loop().time()
 
-        try:
-            await asyncio.wait_for(
-                asyncio.get_running_loop().sock_connect(
-                    raw, (self.connect_host, 443)
-                ),
-                timeout=15,
-            )
-            self._reader, self._writer = await asyncio.wait_for(
-                asyncio.open_connection(
-                    ssl=ctx,
-                    server_hostname=sni,
-                    sock=raw,
-                ),
-                timeout=15,
-            )
-        except Exception:
-            raw.close()
-            raise
-
-        # Verify we actually got HTTP/2
-        ssl_obj = self._writer.get_extra_info("ssl_object")
-        negotiated = ssl_obj.selected_alpn_protocol() if ssl_obj else None
-        if negotiated != "h2":
-            self._writer.close()
-            raise RuntimeError(
-                f"H2 ALPN negotiation failed (got {negotiated!r})"
-            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.get_running_loop().sock_connect(raw, (host, 443)),
+                    timeout=15,
+                )
+                self._reader, self._writer = await asyncio.wait_for(
+                    asyncio.open_connection(
+                        ssl=ctx,
+                        server_hostname=sni,
+                        sock=raw,
+                    ),
+                    timeout=15,
+                )
+                ssl_obj = self._writer.get_extra_info("ssl_object")
+                negotiated = ssl_obj.selected_alpn_protocol() if ssl_obj else None
+                if negotiated != "h2":
+                    self._writer.close()
+                    try:
+                        await self._writer.wait_closed()
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"H2 ALPN negotiation failed (got {negotiated!r})"
+                    )
+                self._record_ip_success(
+                    host, (asyncio.get_running_loop().time() - started) * 1000
+                )
+                break
+            except Exception as exc:
+                last_exc = exc
+                raw.close()
+                self._record_ip_failure(host)
+                log.warning("H2 connect failed via %s, trying next IP: %s", host, exc)
+        else:
+            raise last_exc or OSError("H2 connect failed")
 
         config = h2.config.H2Configuration(
             client_side=True,

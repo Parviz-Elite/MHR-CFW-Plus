@@ -79,6 +79,13 @@ def load_base_config() -> dict:
     return {
         "mode": "apps_script",
         "google_ip": "216.239.38.120",
+        "google_ips": [
+            "216.239.38.120",
+            "216.239.36.120",
+            "142.250.80.142",
+            "172.217.14.206",
+        ],
+        "google_ip_fail_cooldown": 120,
         "front_domain": "www.google.com",
         "listen_host": "127.0.0.1",
         "listen_port": 8085,

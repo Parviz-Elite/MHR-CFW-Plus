@@ -88,6 +88,19 @@ def _build_sni_pool(front_domain: str, overrides: list | None) -> list[str]:
     return [fd] if fd else ["www.google.com"]
 
 
+def _build_connect_host_pool(primary: str, overrides: list | None) -> list[str]:
+    """Build an ordered, de-duplicated Google frontend IP pool."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in [primary, *(overrides or [])]:
+        host = str(item or "").strip()
+        if not host or host in seen:
+            continue
+        seen.add(host)
+        out.append(host)
+    return out or ["216.239.38.120"]
+
+
 class DomainFronter:
     _STATIC_EXTS = STATIC_EXTS
     _H2_FAILURE_COOLDOWN = 60.0
@@ -104,7 +117,20 @@ class DomainFronter:
     _SAFE_RETRY_METHODS = {"GET", "HEAD", "OPTIONS"}
 
     def __init__(self, config: dict):
-        self.connect_host = config.get("google_ip", "216.239.38.120")
+        self._connect_hosts = _build_connect_host_pool(
+            config.get("google_ip", "216.239.38.120"),
+            config.get("google_ips"),
+        )
+        self.connect_host = self._connect_hosts[0]
+        self._connect_idx = 0
+        self._ip_fail_cooldown = self._cfg_float(
+            config, "google_ip_fail_cooldown", 120.0, minimum=5.0,
+        )
+        self._ip_fail_until: dict[str, float] = {}
+        self._ip_stats: dict[str, dict[str, float | int]] = {
+            host: {"successes": 0, "failures": 0, "last_latency_ms": 0.0}
+            for host in self._connect_hosts
+        }
         self.sni_host = config.get("front_domain", "www.google.com")
         # SNI rotation pool — rotated per new outbound TLS connection so
         # DPI systems can't fingerprint traffic as "always one SNI".
@@ -189,6 +215,8 @@ class DomainFronter:
                 self._h2 = H2Transport(
                     self.connect_host, self.sni_host, self.verify_ssl,
                     sni_hosts=self._sni_hosts,
+                    connect_hosts=self._connect_hosts,
+                    ip_fail_cooldown=self._ip_fail_cooldown,
                 )
                 log.info("HTTP/2 multiplexing available — "
                          "all requests will share one connection")
@@ -198,6 +226,9 @@ class DomainFronter:
         if len(self._sni_hosts) > 1:
             log.info("SNI rotation pool (%d): %s",
                      len(self._sni_hosts), ", ".join(self._sni_hosts))
+        if len(self._connect_hosts) > 1:
+            log.info("Google IP failover pool (%d): %s",
+                     len(self._connect_hosts), ", ".join(self._connect_hosts))
         if self._parallel_relay > 1:
             log.info("Fan-out relay: %d parallel Apps Script instances per request",
                      self._parallel_relay)
@@ -235,6 +266,59 @@ class DomainFronter:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         return ctx
+
+    def _next_connect_host(self) -> str:
+        """Pick the next usable Google frontend IP for a new TLS connection."""
+        now = time.monotonic()
+        n = len(self._connect_hosts)
+        for _ in range(n):
+            host = self._connect_hosts[self._connect_idx % n]
+            self._connect_idx += 1
+            until = self._ip_fail_until.get(host, 0.0)
+            if until <= now:
+                self._ip_fail_until.pop(host, None)
+                self.connect_host = host
+                return host
+        host = self._connect_hosts[self._connect_idx % n]
+        self._connect_idx += 1
+        self.connect_host = host
+        return host
+
+    def _record_ip_success(self, host: str, latency_ms: float) -> None:
+        stat = self._ip_stats.setdefault(
+            host, {"successes": 0, "failures": 0, "last_latency_ms": 0.0}
+        )
+        stat["successes"] = int(stat.get("successes", 0)) + 1
+        stat["last_latency_ms"] = round(float(latency_ms), 1)
+        self._ip_fail_until.pop(host, None)
+
+    def _record_ip_failure(self, host: str, exc: Exception) -> None:
+        stat = self._ip_stats.setdefault(
+            host, {"successes": 0, "failures": 0, "last_latency_ms": 0.0}
+        )
+        stat["failures"] = int(stat.get("failures", 0)) + 1
+        if len(self._connect_hosts) > 1:
+            self._ip_fail_until[host] = time.monotonic() + self._ip_fail_cooldown
+            log.warning(
+                "Google IP %s failed (%s); cooling down for %.0fs",
+                host, type(exc).__name__, self._ip_fail_cooldown,
+            )
+
+    def _connect_route_snapshot(self) -> dict:
+        now = time.monotonic()
+        ips = []
+        for host in self._connect_hosts:
+            ips.append({
+                "ip": host,
+                "cooldown_s": int(max(0, self._ip_fail_until.get(host, 0) - now)),
+                **self._ip_stats.get(host, {}),
+            })
+        h2_route = self._h2.route_snapshot() if self._h2 else None
+        return {
+            "active_google_ip": self.connect_host,
+            "google_ips": ips,
+            "h2_route": h2_route,
+        }
 
     def _h2_available(self) -> bool:
         return (
@@ -294,22 +378,34 @@ class DomainFronter:
           "always www.google.com" from the client side.
         """
         loop = asyncio.get_running_loop()
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        sock.setblocking(False)
-        try:
-            await loop.sock_connect(sock, (self.connect_host, 443))
-            return await asyncio.open_connection(
-                sock=sock,
-                ssl=self._ssl_ctx(),
-                server_hostname=self._next_sni(),
-            )
-        except Exception:
+        last_exc = None
+        per_ip_timeout = min(self._tls_connect_timeout, 6.0)
+        for _ in range(len(self._connect_hosts)):
+            host = self._next_connect_host()
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.setblocking(False)
+            started = time.monotonic()
             try:
-                sock.close()
-            except Exception:
-                pass
-            raise
+                await asyncio.wait_for(
+                    loop.sock_connect(sock, (host, 443)),
+                    timeout=per_ip_timeout,
+                )
+                conn = await asyncio.open_connection(
+                    sock=sock,
+                    ssl=self._ssl_ctx(),
+                    server_hostname=self._next_sni(),
+                )
+                self._record_ip_success(host, (time.monotonic() - started) * 1000)
+                return conn
+            except Exception as exc:
+                last_exc = exc
+                self._record_ip_failure(host, exc)
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+        raise last_exc or OSError("Google IP pool exhausted")
 
     def _next_sni(self) -> str:
         """Round-robin the next SNI from the rotation pool."""
@@ -636,6 +732,12 @@ class DomainFronter:
             "per_site": per_site,
             "blacklisted_scripts": blacklisted,
             "sni_rotation": list(self._sni_hosts),
+            "route": self._connect_route_snapshot(),
+            "h2": {
+                "enabled": self._h2 is not None,
+                "connected": bool(self._h2 and self._h2.is_connected),
+                "disabled_for_s": int(max(0, self._h2_disabled_until - time.time())),
+            },
             "parallel_relay": self._parallel_relay,
         }
 
