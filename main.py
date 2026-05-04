@@ -211,6 +211,7 @@ def main():
 
     # Always Apps Script mode — force-set for backward-compat configs.
     config["mode"] = "apps_script"
+    config["_config_path"] = os.path.abspath(config_path)
     sid = config.get("script_ids") or config.get("script_id")
     if not sid or (isinstance(sid, str) and sid == "YOUR_APPS_SCRIPT_DEPLOYMENT_ID"):
         print("Missing 'script_id' in config.")

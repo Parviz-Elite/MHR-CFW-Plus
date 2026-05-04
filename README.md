@@ -129,7 +129,20 @@ try the next one.
 failover pool used by both the HTTP/1.1 connection pool and the HTTP/2
 multiplexed transport.
 
-You can inspect and control runtime health from the local dashboard:
+Open the local control center first:
+
+```text
+http://127.0.0.1:8085/
+```
+
+It links to the two main local pages:
+
+```text
+http://127.0.0.1:8085/status
+http://127.0.0.1:8085/dashboard
+```
+
+Use `/status` to inspect and control runtime health:
 
 ```text
 http://127.0.0.1:8085/status
@@ -139,6 +152,10 @@ The dashboard shows the active Google IP, per-IP failures, cooldowns, H2 state,
 Apps Script health, cache hits, top hosts, and a troubleshooting FAQ. It also
 has safe local controls for clearing cache, clearing IP cooldowns, clearing
 script blacklists, resetting runtime stats, and reconnecting H2.
+
+Use `/dashboard` to view and edit `config.json` from the browser. Secret fields
+are masked as `***`; leaving them unchanged preserves the current value. Saved
+config changes are written to disk and require a proxy restart to apply.
 
 Automation and scripts can read the raw JSON API instead:
 

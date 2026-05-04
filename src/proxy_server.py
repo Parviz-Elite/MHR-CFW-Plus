@@ -9,6 +9,7 @@ as JSON to script.google.com fronted through www.google.com).
 import asyncio
 import json
 import logging
+import os
 import re
 import socket
 import ssl
@@ -187,8 +188,10 @@ class ProxyServer:
 
     def __init__(self, config: dict):
         self._config = dict(config)
+        self._config_path = config.get("_config_path")
         self._started_at = time.time()
         self.host = config.get("listen_host", "127.0.0.1")
+        self._dashboard_lan_access = bool(config.get("dashboard_lan_access", False))
         self.port = config.get("listen_port", 8080)
         self.socks_enabled = config.get("socks5_enabled", True)
         self.socks_host = config.get("socks5_host", self.host)
@@ -1511,8 +1514,8 @@ class ProxyServer:
         parsed = urlparse(url if absolute else f"http://local{url}")
         path = parsed.path.rstrip("/") or "/"
         if path not in {
-            "/status", "/dashboard", "/status.json",
-            "/api/status", "/api/control",
+            "/", "/status", "/dashboard", "/config", "/status.json",
+            "/api/status", "/api/control", "/api/config",
         }:
             return False
         host = parsed.hostname if absolute else self._header_value(headers, "host")
@@ -1553,12 +1556,22 @@ class ProxyServer:
 
         parsed = urlparse(url if "://" in url else f"http://local{url}")
         path = parsed.path.rstrip("/") or "/"
+        if path == "/api/config":
+            if method.upper() == "GET":
+                return self._json_response(self._config_payload())
+            if method.upper() == "POST":
+                return self._handle_config_save(body)
+            return self._plain_response(405, "Method not allowed.")
         if path == "/api/control":
             if method.upper() != "POST":
                 return self._plain_response(405, "Method not allowed.")
             return await self._handle_dashboard_control(body)
         if path in {"/status.json", "/api/status"}:
             return self._json_response(self._status_payload())
+        if path in {"/", ""}:
+            return self._html_response(self._home_html())
+        if path in {"/dashboard", "/config"}:
+            return self._html_response(self._config_html())
         return self._html_response(self._dashboard_html())
 
     async def _handle_dashboard_control(self, body: bytes) -> bytes:
@@ -1589,6 +1602,99 @@ class ProxyServer:
             }, 200 if ok else 409)
 
         return self._json_response({"ok": False, "error": "unknown action"}, 400)
+
+    def _config_payload(self) -> dict:
+        return {
+            "ok": True,
+            "config_path": self._config_path or "config.json",
+            "config": self._editable_config_snapshot(),
+            "restart_required_note": (
+                "Saved config changes are written to disk. Restart the proxy "
+                "to apply listener, relay, certificate, and routing changes."
+            ),
+        }
+
+    def _editable_config_snapshot(self) -> dict:
+        out = {}
+        for key, value in self._config.items():
+            if key.startswith("_"):
+                continue
+            if self._is_secret_config_key(key):
+                out[key] = "***"
+            else:
+                out[key] = value
+        return out
+
+    @staticmethod
+    def _is_secret_config_key(key: str) -> bool:
+        k = key.lower()
+        return "auth_key" in k or k in {"psk", "password", "secret"}
+
+    def _handle_config_save(self, body: bytes) -> bytes:
+        if not self._config_path:
+            return self._json_response({
+                "ok": False,
+                "error": "config path is unavailable",
+            }, 500)
+        try:
+            payload = json.loads(body.decode() or "{}")
+        except json.JSONDecodeError as exc:
+            return self._json_response({
+                "ok": False,
+                "error": f"invalid json: {exc}",
+            }, 400)
+        if not isinstance(payload, dict):
+            return self._json_response({"ok": False, "error": "body must be an object"}, 400)
+
+        new_config = payload.get("config", payload)
+        if not isinstance(new_config, dict):
+            return self._json_response({"ok": False, "error": "config must be an object"}, 400)
+
+        clean = {k: v for k, v in new_config.items() if not str(k).startswith("_")}
+        for key, value in list(clean.items()):
+            if self._is_secret_config_key(str(key)) and value == "***":
+                if key in self._config:
+                    clean[key] = self._config[key]
+                else:
+                    clean.pop(key, None)
+
+        if clean.get("auth_key", "") in {"", "CHANGE_ME_TO_A_STRONG_SECRET", "***"}:
+            return self._json_response({
+                "ok": False,
+                "error": "auth_key is empty or still masked",
+            }, 400)
+        sid = clean.get("script_ids") or clean.get("script_id")
+        if not sid:
+            return self._json_response({
+                "ok": False,
+                "error": "script_id or script_ids is required",
+            }, 400)
+
+        try:
+            config_dir = os.path.dirname(os.path.abspath(self._config_path))
+            if config_dir:
+                os.makedirs(config_dir, exist_ok=True)
+            backup_path = self._config_path + ".bak"
+            if os.path.exists(self._config_path):
+                with open(self._config_path, "rb") as src, open(backup_path, "wb") as dst:
+                    dst.write(src.read())
+            with open(self._config_path, "w", encoding="utf-8") as f:
+                json.dump(clean, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+        except Exception as exc:
+            return self._json_response({
+                "ok": False,
+                "error": f"could not save config: {exc}",
+            }, 500)
+
+        self._config = dict(clean)
+        self._config["_config_path"] = self._config_path
+        return self._json_response({
+            "ok": True,
+            "message": "config saved; restart the proxy to apply changes",
+            "backup": backup_path if "backup_path" in locals() else None,
+            "config": self._editable_config_snapshot(),
+        })
 
     def _status_payload(self) -> dict:
         snap = self.fronter.stats_snapshot()
@@ -1655,6 +1761,152 @@ class ProxyServer:
             b"Content-Length: " + str(len(body)).encode() + b"\r\n"
             b"\r\n" + body
         )
+
+    @staticmethod
+    def _home_html() -> str:
+        return r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MHR-CFW Control</title>
+  <style>
+    body { margin: 0; font-family: Inter, Segoe UI, Tahoma, Arial, sans-serif; background: #f6f7f9; color: #16181d; }
+    .wrap { max-width: 900px; margin: 0 auto; padding: 36px 20px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    p { color: #667085; line-height: 1.6; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin-top: 24px; }
+    a { display: block; text-decoration: none; color: inherit; background: #fff; border: 1px solid #d9dee7; border-radius: 8px; padding: 18px; }
+    a:hover { border-color: #175cd3; background: #f8fbff; }
+    .title { color: #175cd3; font-weight: 750; font-size: 18px; margin-bottom: 8px; }
+    .meta { color: #667085; font-size: 13px; line-height: 1.5; }
+    code { background: #eef1f6; padding: 2px 5px; border-radius: 5px; }
+    @media (max-width: 640px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <h1>MHR-CFW Control Center</h1>
+    <p>Local pages for runtime health, troubleshooting, and config management. Controls are local-only unless <code>dashboard_lan_access</code> is enabled.</p>
+    <section class="grid">
+      <a href="/status">
+        <div class="title">Status</div>
+        <div class="meta">Live Google IP routes, H2 state, Apps Script health, cache stats, traffic, safe runtime actions, and FAQ.</div>
+      </a>
+      <a href="/dashboard">
+        <div class="title">Dashboard</div>
+        <div class="meta">View and edit the config file from a structured JSON editor. Saves to disk and requires restart to apply.</div>
+      </a>
+    </section>
+  </main>
+</body>
+</html>"""
+
+    @staticmethod
+    def _config_html() -> str:
+        return r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MHR-CFW Config Dashboard</title>
+  <style>
+    body { margin: 0; font-family: Inter, Segoe UI, Tahoma, Arial, sans-serif; background: #f6f7f9; color: #16181d; }
+    header { background: #fff; border-bottom: 1px solid #d9dee7; }
+    .wrap { max-width: 1120px; margin: 0 auto; padding: 18px 20px; }
+    .top { display: flex; justify-content: space-between; gap: 14px; align-items: center; }
+    h1 { font-size: 22px; margin: 0; }
+    .sub, .hint { color: #667085; font-size: 13px; line-height: 1.5; }
+    main .wrap { display: grid; gap: 14px; }
+    .panel { background: #fff; border: 1px solid #d9dee7; border-radius: 8px; padding: 14px; }
+    textarea { width: 100%; min-height: 560px; resize: vertical; border: 1px solid #b9c7dc; border-radius: 8px; padding: 12px; font: 13px Consolas, Monaco, monospace; line-height: 1.45; }
+    button, a.btn { border: 1px solid #b9c7dc; background: #fff; color: #175cd3; border-radius: 7px; min-height: 36px; padding: 8px 12px; font-weight: 650; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; }
+    button:hover, a.btn:hover { background: #eef4ff; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .toast { min-height: 20px; color: #667085; font-size: 13px; }
+    .bad { color: #b42318; }
+    .ok { color: #0f7b55; }
+    .fields { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .field { border-top: 1px solid #edf0f5; padding-top: 10px; }
+    .field b { display: block; margin-bottom: 4px; }
+    code { background: #eef1f6; padding: 2px 5px; border-radius: 5px; }
+    @media (max-width: 780px) { .top { align-items: flex-start; flex-direction: column; } .fields { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap top">
+      <div>
+        <h1>Config Dashboard</h1>
+        <div class="sub">View and edit <code>config.json</code>. Secret fields are masked; leave <code>***</code> unchanged to preserve them.</div>
+      </div>
+      <div class="actions">
+        <a class="btn" href="/">Home</a>
+        <a class="btn" href="/status">Status</a>
+        <button id="reload">Reload</button>
+        <button id="format">Format</button>
+        <button id="save">Save Config</button>
+      </div>
+    </div>
+  </header>
+  <main>
+    <div class="wrap">
+      <div class="toast" id="toast"></div>
+      <section class="panel">
+        <div class="hint" id="path"></div>
+        <textarea id="editor" spellcheck="false"></textarea>
+      </section>
+      <section class="panel">
+        <h2>Common Fields</h2>
+        <div class="fields">
+          <div class="field"><b>google_ips</b><span class="hint">Put several working Google frontend IPs here for failover.</span></div>
+          <div class="field"><b>script_ids</b><span class="hint">Use multiple Apps Script deployments for health scoring and fan-out.</span></div>
+          <div class="field"><b>dashboard_lan_access</b><span class="hint">Keep false unless you intentionally expose the dashboard on LAN.</span></div>
+          <div class="field"><b>parallel_relay</b><span class="hint">Race multiple scripts for GET/HEAD style requests when several IDs exist.</span></div>
+          <div class="field"><b>chunked_download_*</b><span class="hint">Tune large download chunk size and parallelism carefully.</span></div>
+          <div class="field"><b>bypass_hosts / block_hosts</b><span class="hint">Control direct routing or blocking by exact host or suffix rules.</span></div>
+        </div>
+      </section>
+    </div>
+  </main>
+  <script>
+    const editor = document.getElementById('editor');
+    const toast = document.getElementById('toast');
+    const show = (msg, cls='') => { toast.className = 'toast ' + cls; toast.textContent = msg; };
+    async function loadConfig() {
+      show('Loading...');
+      const data = await fetch('/api/config', {cache: 'no-store'}).then(r => r.json());
+      document.getElementById('path').textContent = `Config path: ${data.config_path}. ${data.restart_required_note}`;
+      editor.value = JSON.stringify(data.config, null, 2);
+      show('Config loaded.', 'ok');
+    }
+    function parseEditor() {
+      try { return JSON.parse(editor.value); }
+      catch (e) { show(String(e), 'bad'); throw e; }
+    }
+    document.getElementById('reload').onclick = loadConfig;
+    document.getElementById('format').onclick = () => {
+      const obj = parseEditor();
+      editor.value = JSON.stringify(obj, null, 2);
+      show('Formatted.', 'ok');
+    };
+    document.getElementById('save').onclick = async () => {
+      const config = parseEditor();
+      show('Saving...');
+      const res = await fetch('/api/config', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({config})
+      });
+      const data = await res.json();
+      if (!data.ok) { show(data.error || 'Save failed.', 'bad'); return; }
+      editor.value = JSON.stringify(data.config, null, 2);
+      show(data.message || 'Saved.', 'ok');
+    };
+    loadConfig();
+  </script>
+</body>
+</html>"""
 
     @staticmethod
     def _dashboard_html() -> str:
@@ -1752,6 +2004,8 @@ class ProxyServer:
         <div class="sub">Local dashboard for relay health, routes, cache, and troubleshooting</div>
       </div>
       <div class="actions">
+        <button onclick="location.href='/'">Home</button>
+        <button onclick="location.href='/dashboard'">Config</button>
         <button data-action="clear_route_cooldowns">Clear IP Cooldowns</button>
         <button data-action="clear_script_blacklist">Clear Script Blacklist</button>
         <button data-action="clear_cache">Clear Cache</button>
@@ -1847,4 +2101,3 @@ class ProxyServer:
   </script>
 </body>
 </html>"""
-        self._dashboard_lan_access = bool(config.get("dashboard_lan_access", False))

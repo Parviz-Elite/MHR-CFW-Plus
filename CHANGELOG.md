@@ -12,6 +12,8 @@
   Google IP state, per-IP success/failure counts, cooldowns, H2 status, Apps
   Script health, cache stats, top relay hosts, and a built-in troubleshooting
   FAQ.
+- Added a local home page at `/` and a config dashboard at `/dashboard` for
+  viewing and safely editing `config.json` from the browser.
 - Added dashboard control actions for clearing cache, clearing route cooldowns,
   clearing script blacklists, resetting runtime stats, and reconnecting H2.
 - Added Apps Script health scoring so script latency/failure history is visible
